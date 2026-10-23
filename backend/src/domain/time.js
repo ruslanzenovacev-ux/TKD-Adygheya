@@ -1,10 +1,11 @@
-// Даты занятий и абонементов храним как 'YYYY-MM-DD' по московскому времени,
+// Даты занятий и абонементов храним как 'YYYY-MM-DD' по местному времени секции,
 // чтобы «сегодня» у тренера в зале и на сервере совпадало.
+// Часовой пояс секции — переменная CLUB_UTC_OFFSET (часы от UTC), по умолчанию Москва (+3).
 
-const MSK_OFFSET_MS = 3 * 60 * 60 * 1000;
+const OFFSET_MS = Number(process.env.CLUB_UTC_OFFSET ?? 3) * 60 * 60 * 1000;
 
 export function mskDate(date) {
-  return new Date(date.getTime() + MSK_OFFSET_MS).toISOString().slice(0, 10);
+  return new Date(date.getTime() + OFFSET_MS).toISOString().slice(0, 10);
 }
 
 export function addDays(isoDate, days) {

@@ -1,2 +1,7 @@
 node_modules/
 *.zip
+app/build/
+app/.dart_tool/
+app/.flutter-plugins*
+app/.idea/
+*.jks

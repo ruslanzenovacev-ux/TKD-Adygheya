@@ -1,0 +1,212 @@
+# Сборка и выпуск приложения.
+#
+# • Каждый push в main: тесты сервера и приложения, сборка APK и веб-версии (скачать — во вкладке Actions → Artifacts).
+# • Выпуск новой версии для всех: Actions → «Сборка и выпуск» → Run workflow → отметить «Выпустить».
+#   APK, веб-версия и version.json выкладываются в Yandex Object Storage — приложения у родителей
+#   увидят новую версию и предложат обновиться.
+#
+# Настройки репозитория (Settings → Secrets and variables → Actions):
+#   Variables: API_URL (адрес API Gateway), YC_BUCKET (имя бакета), PRIVACY_URL, CLUB_NAME, MIN_BUILD (необязательно)
+#   Secrets:   ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS — ключ подписи APK
+#              YC_S3_KEY_ID, YC_S3_SECRET — статический ключ сервисного аккаунта с правом записи в бакет
+
+name: Сборка и выпуск
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Выпустить новую версию для всех пользователей'
+        type: boolean
+        default: false
+      notes:
+        description: 'Что нового (увидят пользователи)'
+        type: string
+        default: ''
+      required:
+        description: 'Обязательное обновление (старые версии не смогут работать без обновления)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+permissions:
+  contents: write
+
+jobs:
+  backend:
+    name: Сервер — тесты
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm test
+
+  app:
+    name: Приложение — сборка
+    needs: backend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    env:
+      YC_BUCKET: ${{ vars.YC_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Подготовка проекта
+        # Создаёт недостающие служебные файлы Flutter (gradle, иконки). Наши файлы не перезаписываются.
+        run: |
+          flutter --version
+          flutter create --org ru.tkdclub --project-name tkd_app --platforms android,web .
+          flutter pub get
+
+      - name: Проверка кода
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Тесты
+        run: flutter test
+
+      - name: Номер версии
+        id: ver
+        run: |
+          BUILD=$((100 + GITHUB_RUN_NUMBER))
+          VERSION="1.0.${GITHUB_RUN_NUMBER}"
+          if [ -n "$YC_BUCKET" ]; then SITE="https://${YC_BUCKET}.website.yandexcloud.net"; else SITE=""; fi
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "site=$SITE" >> "$GITHUB_OUTPUT"
+          echo "Версия $VERSION (сборка $BUILD)"
+
+      - name: Сборка APK
+        run: |
+          UPDATE_URL=""
+          [ -n "${{ steps.ver.outputs.site }}" ] && UPDATE_URL="${{ steps.ver.outputs.site }}/version.json"
+          flutter build apk --release \
+            --build-name "${{ steps.ver.outputs.version }}" \
+            --build-number "${{ steps.ver.outputs.build }}" \
+            --dart-define=API_URL="${{ vars.API_URL }}" \
+            --dart-define=UPDATE_URL="$UPDATE_URL" \
+            --dart-define=APP_BUILD="${{ steps.ver.outputs.build }}" \
+            --dart-define=APP_VERSION="${{ steps.ver.outputs.version }}" \
+            --dart-define=PRIVACY_URL="${{ vars.PRIVACY_URL }}" \
+            --dart-define=CLUB_NAME="${{ vars.CLUB_NAME || 'Тхэквондо' }}"
+
+      - name: Подпись APK постоянным ключом
+        # Обновление поверх установленной версии возможно, только если все версии подписаны одним ключом.
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          mkdir -p dist
+          OUT="dist/tkd-${{ steps.ver.outputs.version }}.apk"
+          SRC="build/app/outputs/flutter-apk/app-release.apk"
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::warning::Ключ подписи не настроен — APK подписан временным ключом и годится только для проверки."
+            cp "$SRC" "$OUT"
+          else
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            APKSIGNER="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)apksigner"
+            "$APKSIGNER" sign --ks "$RUNNER_TEMP/release.jks" --ks-key-alias "$KEY_ALIAS" \
+              --ks-pass env:KEYSTORE_PASSWORD --key-pass env:KEYSTORE_PASSWORD --out "$OUT" "$SRC"
+            "$APKSIGNER" verify --print-certs "$OUT" | head -3
+            rm -f "$RUNNER_TEMP/release.jks"
+          fi
+          sha256sum "$OUT" | cut -d' ' -f1 > dist/apk.sha256
+          ls -la dist
+
+      - name: Сборка веб-версии (для iPhone)
+        run: |
+          UPDATE_URL=""
+          [ -n "${{ steps.ver.outputs.site }}" ] && UPDATE_URL="${{ steps.ver.outputs.site }}/version.json"
+          flutter build web --release --base-href /web/ \
+            --dart-define=API_URL="${{ vars.API_URL }}" \
+            --dart-define=UPDATE_URL="$UPDATE_URL" \
+            --dart-define=APP_BUILD="${{ steps.ver.outputs.build }}" \
+            --dart-define=APP_VERSION="${{ steps.ver.outputs.version }}" \
+            --dart-define=PRIVACY_URL="${{ vars.PRIVACY_URL }}" \
+            --dart-define=CLUB_NAME="${{ vars.CLUB_NAME || 'Тхэквондо' }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tkd-${{ steps.ver.outputs.version }}-android
+          path: app/dist/*.apk
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tkd-${{ steps.ver.outputs.version }}-web
+          path: app/build/web
+          retention-days: 7
+
+      - name: Выпуск для пользователей
+        if: github.event_name == 'workflow_dispatch' && inputs.release
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.YC_S3_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.YC_S3_SECRET }}
+          AWS_DEFAULT_REGION: ru-central1
+          GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ inputs.notes }}
+          REQUIRED: ${{ inputs.required }}
+          MIN_BUILD_VAR: ${{ vars.MIN_BUILD }}
+        run: |
+          set -euo pipefail
+          [ -n "$KEYSTORE_BASE64" ] || { echo "::error::Нельзя выпускать без постоянного ключа подписи"; exit 1; }
+          [ -n "$YC_BUCKET" ] && [ -n "$AWS_ACCESS_KEY_ID" ] || { echo "::error::Не настроены YC_BUCKET / YC_S3_KEY_ID / YC_S3_SECRET"; exit 1; }
+          S3="aws s3 --endpoint-url https://storage.yandexcloud.net"
+          VERSION="${{ steps.ver.outputs.version }}"
+          BUILD="${{ steps.ver.outputs.build }}"
+          SITE="${{ steps.ver.outputs.site }}"
+          APK="dist/tkd-$VERSION.apk"
+
+          if [ "$REQUIRED" = "true" ]; then MIN_BUILD="$BUILD"; else MIN_BUILD="${MIN_BUILD_VAR:-0}"; fi
+
+          # 1. APK: версия с номером (для автообновления) и «последняя» (ссылка для первой установки).
+          $S3 cp "$APK" "s3://$YC_BUCKET/apk/tkd-$VERSION.apk" --content-type application/vnd.android.package-archive
+          $S3 cp "$APK" "s3://$YC_BUCKET/apk/tkd-latest.apk" --content-type application/vnd.android.package-archive --cache-control no-cache
+
+          # 2. Веб-версия. Служебные файлы — без кэша, чтобы iPhone сразу получал новую версию.
+          $S3 sync build/web "s3://$YC_BUCKET/web" --delete --exclude index.html --exclude flutter_bootstrap.js --exclude main.dart.js --exclude flutter_service_worker.js --exclude version.json
+          for f in index.html flutter_bootstrap.js main.dart.js flutter_service_worker.js version.json; do
+            [ -f "build/web/$f" ] && $S3 cp "build/web/$f" "s3://$YC_BUCKET/web/$f" --cache-control no-cache
+          done
+
+          # 3. version.json — последним, когда всё уже на месте.
+          jq -n --arg version "$VERSION" --argjson build "$BUILD" --argjson minBuild "$MIN_BUILD" \
+                --arg apkUrl "$SITE/apk/tkd-$VERSION.apk" --arg sha256 "$(cat dist/apk.sha256)" --arg notes "$NOTES" \
+                '{version:$version, build:$build, minBuild:$minBuild, apkUrl:$apkUrl, sha256:$sha256, notes:$notes}' > dist/version.json
+          cat dist/version.json
+          $S3 cp dist/version.json "s3://$YC_BUCKET/version.json" --content-type application/json --cache-control no-cache
+
+          # 4. Релиз на GitHub — история версий.
+          cd ..
+          gh release create "v$VERSION" "app/$APK" --title "Версия $VERSION" --notes "${NOTES:-Без описания}"
+
+          {
+            echo "### Выпущена версия $VERSION"
+            echo "- Скачать APK: $SITE/apk/tkd-latest.apk"
+            echo "- Веб-версия для iPhone: $SITE/web/"
+            echo "- Обязательное обновление: $REQUIRED (minBuild=$MIN_BUILD)"
+          } >> "$GITHUB_STEP_SUMMARY"

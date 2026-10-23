@@ -1,0 +1,5 @@
+analyzer:
+  language:
+    strict-casts: false
+  errors:
+    deprecated_member_use: ignore
