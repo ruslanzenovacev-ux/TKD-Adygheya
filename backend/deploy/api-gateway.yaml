@@ -1,0 +1,19 @@
+# Спецификация Yandex API Gateway: все запросы → одна облачная функция.
+# Подставьте FUNCTION_ID и SERVICE_ACCOUNT_ID (сервисный аккаунт с ролью functions.functionInvoker).
+openapi: 3.0.0
+info:
+  title: tkd-api
+  version: 1.0.0
+paths:
+  /{path+}:
+    x-yc-apigateway-any-method:
+      parameters:
+        - name: path
+          in: path
+          required: false
+          schema:
+            type: string
+      x-yc-apigateway-integration:
+        type: cloud_functions
+        function_id: FUNCTION_ID
+        service_account_id: SERVICE_ACCOUNT_ID
