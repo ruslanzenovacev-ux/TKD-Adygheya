@@ -1,0 +1,93 @@
+# Развёртывание сервера в Yandex Cloud.
+# Запускается автоматически при изменении папки backend/ и вручную: Actions → «Развёртывание сервера» → Run workflow.
+#
+# Нужно в Settings → Secrets and variables → Actions:
+#   Secrets:   YC_SA_KEY_JSON (авторизованный ключ сервисного аккаунта github-deploy), YC_FOLDER_ID
+#   Variables: ADMIN_EMAILS (почта руководителя), YC_BUCKET (необязательно, по умолчанию tkdadygea01-app)
+# Позже (когда подключим): YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY, POSTBOX_ACCESS_KEY_ID, POSTBOX_SECRET_ACCESS_KEY (secrets),
+#   MAIL_FROM, RECEIPTS_ENABLED, RECEIPT_VAT_CODE, TAX_SYSTEM_CODE (variables)
+
+name: Развёртывание сервера
+
+on:
+  push:
+    branches: [main]
+    paths: ['backend/**', '.github/workflows/deploy-backend.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Yandex Cloud
+    runs-on: ubuntu-latest
+    env:
+      YC_SA_KEY_JSON: ${{ secrets.YC_SA_KEY_JSON }}
+      YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
+      BUCKET: ${{ vars.YC_BUCKET || 'tkdadygea01-app' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Проверка настроек
+        id: check
+        run: |
+          if [ -z "$YC_SA_KEY_JSON" ] || [ -z "$YC_FOLDER_ID" ]; then
+            echo "::notice::Yandex Cloud ещё не подключён (нет секретов YC_SA_KEY_JSON / YC_FOLDER_ID) — пропускаю развёртывание."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v5
+        if: steps.check.outputs.ready == 'true'
+        with:
+          node-version: 22
+
+      - name: Тесты сервера
+        if: steps.check.outputs.ready == 'true'
+        working-directory: backend
+        run: npm test
+
+      - name: Установка yc и ydb CLI
+        if: steps.check.outputs.ready == 'true'
+        run: |
+          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -i "$HOME/yc" -n
+          echo "$HOME/yc/bin" >> "$GITHUB_PATH"
+          curl -sSL https://install.ydb.tech/cli | bash
+          echo "$HOME/ydb/bin" >> "$GITHUB_PATH"
+
+      - name: Вход в Yandex Cloud
+        if: steps.check.outputs.ready == 'true'
+        run: |
+          printf '%s' "$YC_SA_KEY_JSON" > "$RUNNER_TEMP/sa.json"
+          yc config profile create ci >/dev/null
+          yc config set service-account-key "$RUNNER_TEMP/sa.json"
+          yc config set folder-id "$YC_FOLDER_ID"
+          yc resource-manager folder get --id "$YC_FOLDER_ID" --format json | jq -r '"Каталог: " + .name'
+
+      - name: Развёртывание
+        if: steps.check.outputs.ready == 'true'
+        env:
+          SA_KEY_FILE: ${{ runner.temp }}/sa.json
+          ADMIN_EMAILS: ${{ vars.ADMIN_EMAILS }}
+          CLUB_UTC_OFFSET: ${{ vars.CLUB_UTC_OFFSET }}
+          YOOKASSA_SHOP_ID: ${{ secrets.YOOKASSA_SHOP_ID }}
+          YOOKASSA_SECRET_KEY: ${{ secrets.YOOKASSA_SECRET_KEY }}
+          YOOKASSA_ALLOW_CARDS: ${{ vars.YOOKASSA_ALLOW_CARDS }}
+          RECEIPTS_ENABLED: ${{ vars.RECEIPTS_ENABLED }}
+          RECEIPT_VAT_CODE: ${{ vars.RECEIPT_VAT_CODE }}
+          TAX_SYSTEM_CODE: ${{ vars.TAX_SYSTEM_CODE }}
+          POSTBOX_ACCESS_KEY_ID: ${{ secrets.POSTBOX_ACCESS_KEY_ID }}
+          POSTBOX_SECRET_ACCESS_KEY: ${{ secrets.POSTBOX_SECRET_ACCESS_KEY }}
+          MAIL_FROM: ${{ vars.MAIL_FROM }}
+        run: |
+          # Секрет для кодов входа выводится из ключа сервисного аккаунта — отдельно хранить не нужно.
+          export APP_SECRET="$(printf 'tkd-app-secret:%s' "$YC_SA_KEY_JSON" | sha256sum | cut -c1-64)"
+          echo "::add-mask::$APP_SECRET"
+          bash backend/deploy/deploy.sh
+
+      - name: Удалить ключ
+        if: always()
+        run: rm -f "$RUNNER_TEMP/sa.json"

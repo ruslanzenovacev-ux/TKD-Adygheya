@@ -9,8 +9,8 @@ export function loadConfig(env = process.env) {
   return {
     // Случайная строка ≥ 32 символов: «соль» для кодов входа. Сгенерировать: openssl rand -hex 32
     secret: required('APP_SECRET'),
-    // Почта руководителя секции: при первом входе получает роль администратора. Через запятую.
-    adminEmails: (env.ADMIN_EMAILS ?? '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),
+    // Почта руководителя секции: при первом входе получает роль администратора. Несколько — через «;».
+    adminEmails: (env.ADMIN_EMAILS ?? '').split(/[,;\s]+/).map((s) => s.trim().toLowerCase()).filter(Boolean),
     // Куда ЮKassa вернёт родителя после оплаты (страница, которая открывает приложение).
     returnUrl: env.RETURN_URL ?? 'https://example.ru/paid',
     corsOrigin: env.CORS_ORIGIN ?? '*',

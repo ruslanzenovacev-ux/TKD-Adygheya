@@ -59,28 +59,17 @@ npm run dev     # локальный сервер http://localhost:8787 с де�
 
 ## Развёртывание в Yandex Cloud
 
-1. **Платёжный аккаунт.** Создайте его и сразу настройте уведомление о расходах (Биллинг → Бюджеты), например на 100 ₽.
-2. **База.** Создайте Managed Service for YDB в режиме *Serverless*. Выполните `backend/schema/schema.yql` во вкладке «Навигация → Новый SQL-запрос».
-3. **Сервисный аккаунт** `tkd-backend` с ролями `ydb.editor`, `functions.functionInvoker` и `postbox.sender`.
-4. **Почта.** Подключите Postbox: подтвердите домен-отправитель и создайте статический ключ доступа для сервисного аккаунта.
-5. **Функция** `tkd-api`: среда Node.js 22, точка входа `src/handler.handler`, память 256 МБ, таймаут 30 с, сервисный аккаунт `tkd-backend`. Код — ZIP папки `backend/` без `node_modules`, зависимости облако поставит само из `package.json`. Переменные окружения:
+Сервер выкладывается **автоматически через GitHub** (`.github/workflows/deploy-backend.yml` + `backend/deploy/deploy.sh`) при каждом изменении папки `backend/` или вручную: Actions → «Развёртывание сервера» → Run workflow. Скрипт сам создаёт сервисный аккаунт функции, базу YDB и таблицы, функцию, API Gateway и хранилище для APK и веб-версии. Повторный запуск ничего не ломает, а только выкладывает новую версию.
 
-   | Переменная | Значение |
-   |---|---|
-   | `YDB_ENDPOINT` | `grpcs://ydb.serverless.yandexcloud.net:2135` |
-   | `YDB_DATABASE` | путь базы из её карточки (`/ru-central1/…`) |
-   | `YDB_METADATA_CREDENTIALS` | `1` |
-   | `APP_SECRET` | случайная строка: `openssl rand -hex 32` |
-   | `ADMIN_EMAILS` | почта руководителя секции |
-   | `RETURN_URL` | страница «Оплата прошла», куда ЮKassa вернёт родителя |
-   | `YOOKASSA_SHOP_ID`, `YOOKASSA_SECRET_KEY` | из кабинета ЮKassa (сначала ключи тестового магазина) |
-   | `RECEIPTS_ENABLED`, `RECEIPT_VAT_CODE`, `TAX_SYSTEM_CODE` | чеки 54-ФЗ: `1`, `1` (без НДС), код СНО — уточнить у бухгалтера |
-   | `POSTBOX_ACCESS_KEY_ID`, `POSTBOX_SECRET_ACCESS_KEY`, `MAIL_FROM` | Postbox |
+Что нужно сделать вручную один раз:
+1. В консоли Yandex Cloud: платёжный аккаунт и уведомление о расходах (Биллинг → Бюджеты).
+2. Сервисный аккаунт `github-deploy` с ролью `admin` на каталог и его **авторизованный ключ** (JSON).
+3. В GitHub (Settings → Secrets and variables → Actions):
+   - секреты `YC_SA_KEY_JSON` (содержимое JSON-ключа) и `YC_FOLDER_ID`;
+   - переменная `ADMIN_EMAILS` — почта руководителя.
+4. Позже: секреты ЮKassa (`YOOKASSA_SHOP_ID`, `YOOKASSA_SECRET_KEY`) и почты Postbox (`POSTBOX_ACCESS_KEY_ID`, `POSTBOX_SECRET_ACCESS_KEY` + переменная `MAIL_FROM`). После добавления запустите развёртывание ещё раз.
 
-   Секреты лучше положить в Lockbox и подключить к функции оттуда.
-6. **API Gateway.** Создайте его из `backend/deploy/api-gateway.yaml`, подставив id функции и сервисного аккаунта. Проверка: `https://<домен-шлюза>/health` → `{"ok":true}`.
-7. **ЮKassa.** В кабинете (Интеграция → HTTP-уведомления) укажите адрес `https://<домен-шлюза>/webhooks/yookassa` и события `payment.succeeded` и `payment.canceled`.
-8. **Тест.** Пройдите оплату в тестовом магазине, потом переключите на боевые ключи и сделайте 2–3 реальные оплаты по 10 ₽.
+В ЮKassa (Интеграция → HTTP-уведомления) укажите адрес из итогов развёртывания: `https://<домен-шлюза>/webhooks/yookassa`, события `payment.succeeded` и `payment.canceled`.
 
 > Модуль `src/repo/ydb.js` (работа с YDB) и отправка писем через Postbox проверяются только в облаке, на шагах 5–8. Вся остальная логика покрыта автотестами.
 
@@ -112,9 +101,8 @@ npm run dev     # локальный сервер http://localhost:8787 с де�
 | Тип | Имя | Что это |
 |---|---|---|
 | Secret | `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` | ключ подписи APK |
-| Secret | `YC_S3_KEY_ID`, `YC_S3_SECRET` | статический ключ сервисного аккаунта с ролью `storage.editor` |
-| Variable | `API_URL` | адрес API Gateway, например `https://d5d….apigw.yandexcloud.net` |
-| Variable | `YC_BUCKET` | бакет Object Storage с публичным чтением и включённым хостингом сайта |
+| Secret | `YC_SA_KEY_JSON`, `YC_FOLDER_ID` | доступ к Yandex Cloud: адрес сервера и выкладка обновлений берутся оттуда автоматически |
+| Variable | `ADMIN_EMAILS` | почта руководителя секции (администратор) |
 | Variable | `PRIVACY_URL` | страница политики конфиденциальности |
 | Variable | `CLUB_NAME` | название секции на экране входа |
 

@@ -6,9 +6,10 @@
 #   увидят новую версию и предложат обновиться.
 #
 # Настройки репозитория (Settings → Secrets and variables → Actions):
-#   Variables: API_URL (адрес API Gateway), YC_BUCKET (имя бакета), PRIVACY_URL, CLUB_NAME, MIN_BUILD (необязательно)
 #   Secrets:   ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS — ключ подписи APK
-#              YC_S3_KEY_ID, YC_S3_SECRET — статический ключ сервисного аккаунта с правом записи в бакет
+#              YC_SA_KEY_JSON, YC_FOLDER_ID — доступ к Yandex Cloud (адрес API и выкладка берутся оттуда автоматически)
+#   Variables (необязательно): PRIVACY_URL, CLUB_NAME, MIN_BUILD, YC_BUCKET (по умолчанию tkdadygea01-app),
+#              API_URL (если нужно переопределить адрес сервера)
 
 name: Сборка и выпуск
 
@@ -60,9 +61,32 @@ jobs:
       run:
         working-directory: app
     env:
-      YC_BUCKET: ${{ vars.YC_BUCKET }}
+      YC_BUCKET: ${{ vars.YC_BUCKET || 'tkdadygea01-app' }}
+      YC_SA_KEY_JSON: ${{ secrets.YC_SA_KEY_JSON }}
+      YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
     steps:
       - uses: actions/checkout@v5
+
+      - name: Yandex Cloud — адрес сервера
+        id: yc
+        run: |
+          if [ -z "$YC_SA_KEY_JSON" ] || [ -z "$YC_FOLDER_ID" ]; then
+            echo "::notice::Yandex Cloud не подключён — приложение будет смотреть на тестовый сервер."
+            exit 0
+          fi
+          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -i "$HOME/yc" -n >/dev/null
+          echo "$HOME/yc/bin" >> "$GITHUB_PATH"
+          printf '%s' "$YC_SA_KEY_JSON" > "$RUNNER_TEMP/sa.json"
+          "$HOME/yc/bin/yc" config profile create ci >/dev/null
+          "$HOME/yc/bin/yc" config set service-account-key "$RUNNER_TEMP/sa.json"
+          "$HOME/yc/bin/yc" config set folder-id "$YC_FOLDER_ID"
+          DOMAIN=$("$HOME/yc/bin/yc" serverless api-gateway get --name tkd-gw --format json 2>/dev/null | jq -r '.domain // empty' || true)
+          if [ -n "$DOMAIN" ]; then
+            echo "api_url=https://$DOMAIN" >> "$GITHUB_OUTPUT"
+            echo "Сервер: https://$DOMAIN"
+          else
+            echo "::warning::Сервер ещё не развёрнут — сначала запустите «Развёртывание сервера»."
+          fi
 
       - uses: actions/setup-java@v5
         with:
@@ -92,7 +116,7 @@ jobs:
         run: |
           BUILD=$((100 + GITHUB_RUN_NUMBER))
           VERSION="1.0.${GITHUB_RUN_NUMBER}"
-          if [ -n "$YC_BUCKET" ]; then SITE="https://${YC_BUCKET}.website.yandexcloud.net"; else SITE=""; fi
+          SITE="https://${YC_BUCKET}.website.yandexcloud.net"
           echo "build=$BUILD" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "site=$SITE" >> "$GITHUB_OUTPUT"
@@ -105,7 +129,7 @@ jobs:
           flutter build apk --release \
             --build-name "${{ steps.ver.outputs.version }}" \
             --build-number "${{ steps.ver.outputs.build }}" \
-            --dart-define=API_URL="${{ vars.API_URL }}" \
+            --dart-define=API_URL="${{ vars.API_URL || steps.yc.outputs.api_url }}" \
             --dart-define=UPDATE_URL="$UPDATE_URL" \
             --dart-define=APP_BUILD="${{ steps.ver.outputs.build }}" \
             --dart-define=APP_VERSION="${{ steps.ver.outputs.version }}" \
@@ -141,7 +165,7 @@ jobs:
           UPDATE_URL=""
           [ -n "${{ steps.ver.outputs.site }}" ] && UPDATE_URL="${{ steps.ver.outputs.site }}/version.json"
           flutter build web --release --base-href /web/ \
-            --dart-define=API_URL="${{ vars.API_URL }}" \
+            --dart-define=API_URL="${{ vars.API_URL || steps.yc.outputs.api_url }}" \
             --dart-define=UPDATE_URL="$UPDATE_URL" \
             --dart-define=APP_BUILD="${{ steps.ver.outputs.build }}" \
             --dart-define=APP_VERSION="${{ steps.ver.outputs.version }}" \
@@ -164,8 +188,6 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.release
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.YC_S3_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.YC_S3_SECRET }}
           AWS_DEFAULT_REGION: ru-central1
           GH_TOKEN: ${{ github.token }}
           NOTES: ${{ inputs.notes }}
@@ -174,7 +196,18 @@ jobs:
         run: |
           set -euo pipefail
           [ -n "$KEYSTORE_BASE64" ] || { echo "::error::Нельзя выпускать без постоянного ключа подписи"; exit 1; }
-          [ -n "$YC_BUCKET" ] && [ -n "$AWS_ACCESS_KEY_ID" ] || { echo "::error::Не настроены YC_BUCKET / YC_S3_KEY_ID / YC_S3_SECRET"; exit 1; }
+          [ -f "$RUNNER_TEMP/sa.json" ] || { echo "::error::Не подключён Yandex Cloud (секреты YC_SA_KEY_JSON / YC_FOLDER_ID)"; exit 1; }
+          [ -n "${{ steps.yc.outputs.api_url }}${{ vars.API_URL }}" ] || { echo "::error::Сервер не развёрнут — приложение не будет работать"; exit 1; }
+
+          # Временный ключ для записи в хранилище: создаётся на время выпуска и сразу удаляется.
+          SA_ID=$(jq -r .service_account_id "$RUNNER_TEMP/sa.json")
+          KEY_JSON=$(yc iam access-key create --service-account-id "$SA_ID" --description "release $GITHUB_RUN_NUMBER" --format json)
+          KEY_ID=$(echo "$KEY_JSON" | jq -r .access_key.id)
+          export AWS_ACCESS_KEY_ID=$(echo "$KEY_JSON" | jq -r .access_key.key_id)
+          export AWS_SECRET_ACCESS_KEY=$(echo "$KEY_JSON" | jq -r .secret)
+          echo "::add-mask::$AWS_SECRET_ACCESS_KEY"
+          trap 'yc iam access-key delete --id "$KEY_ID" >/dev/null || true' EXIT
+          sleep 5
           S3="aws s3 --endpoint-url https://storage.yandexcloud.net"
           VERSION="${{ steps.ver.outputs.version }}"
           BUILD="${{ steps.ver.outputs.build }}"
@@ -210,3 +243,7 @@ jobs:
             echo "- Веб-версия для iPhone: $SITE/web/"
             echo "- Обязательное обновление: $REQUIRED (minBuild=$MIN_BUILD)"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Удалить ключ
+        if: always()
+        run: rm -f "$RUNNER_TEMP/sa.json"
